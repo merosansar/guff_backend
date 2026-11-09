@@ -50,11 +50,24 @@ export class PeopleService {
 
   async updateProfile(
     id: string,
-    input: { name?: string | undefined; title?: string | undefined },
+    input: {
+      name?: string | undefined;
+      title?: string | undefined;
+      customStatus?: { emoji: string; text: string; expiresAt: Date | null } | null | undefined;
+      dndUntil?: Date | null | undefined;
+    },
   ): Promise<UserWithPresence> {
-    const changes: Record<string, string> = {};
+    const changes: Record<string, unknown> = {};
     if (input.name !== undefined) changes.name = input.name.trim();
     if (input.title !== undefined) changes.title = input.title.trim();
+    if (input.customStatus !== undefined) {
+      const s = input.customStatus;
+      changes.customStatus =
+        s && (s.emoji || s.text.trim())
+          ? { emoji: s.emoji, text: s.text.trim(), expiresAt: s.expiresAt }
+          : null;
+    }
+    if (input.dndUntil !== undefined) changes.dndUntil = input.dndUntil;
     const user = await User.findByIdAndUpdate(
       id,
       { $set: changes },

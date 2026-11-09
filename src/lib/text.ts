@@ -11,6 +11,13 @@ export function extractMentionIds(text: string): string[] {
   return [...ids];
 }
 
+/** The first web link in a message (not inside code), for a preview. */
+export function firstUrl(text: string): string | null {
+  const withoutCode = text.replace(/```[\s\S]*?```/g, ' ').replace(/`[^`\n]*`/g, ' ');
+  const match = /https?:\/\/[^\s<>]*[^\s<>.,:;"')\]!?]/i.exec(withoutCode);
+  return match ? match[0] : null;
+}
+
 /** Unix line endings, no trailing spaces on lines, nothing blank at the start or end. */
 export function normalizeText(text: string): string {
   return text

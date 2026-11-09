@@ -16,6 +16,8 @@ export interface ChannelDoc {
   dmKey: string | null;
   memberCount: number;
   lastMessageAt: Date | null;
+  /** Archived channels stay readable but nobody can post in them. */
+  archivedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -30,6 +32,7 @@ const channelSchema = new Schema<ChannelDoc>(
     dmKey: { type: String, default: null },
     memberCount: { type: Number, default: 0, min: 0 },
     lastMessageAt: { type: Date, default: null },
+    archivedAt: { type: Date, default: null },
   },
   { timestamps: true },
 );

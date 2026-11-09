@@ -31,12 +31,36 @@ export function messageDto(m: MessageDoc, files: FileService): MessageDto {
     createdAt: m._id.getTimestamp().toISOString(),
     editedAt: iso(m.editedAt),
     deletedAt: iso(m.deletedAt),
+    editCount: m.deletedAt ? 0 : (m.edits?.length ?? 0),
+    pinnedAt: m.deletedAt ? null : iso(m.pinnedAt),
+    pinnedBy: m.pinnedBy && !m.deletedAt ? m.pinnedBy.toString() : null,
+    threadRootId: m.threadRootId ? m.threadRootId.toString() : null,
+    thread:
+      m.thread && m.thread.replyCount > 0
+        ? {
+            replyCount: m.thread.replyCount,
+            lastReplyAt: iso(m.thread.lastReplyAt),
+            participantIds: (m.thread.participantIds ?? []).map(String),
+          }
+        : null,
+    linkPreview: m.linkPreview && !m.deletedAt ? { ...m.linkPreview } : null,
+    webhook: m.webhook ? { id: m.webhook.id.toString(), name: m.webhook.name } : null,
+    reminder: m.reminder ?? false,
+    ref: m.ref
+      ? {
+          channelId: m.ref.channelId.toString(),
+          messageId: m.ref.messageId.toString(),
+          authorId: m.ref.authorId.toString(),
+          excerpt: m.ref.excerpt,
+        }
+      : null,
   };
 }
 
 export function channelDto(
   c: ChannelDoc,
-  membership: Pick<MembershipDoc, 'role' | 'lastReadId'> | null,
+  membership: Pick<MembershipDoc, 'role' | 'lastReadId'> & Partial<Pick<MembershipDoc, 'notify'>>
+    | null,
   extra: { unread?: number; mentions?: number; dmUserId?: Types.ObjectId | string | null } = {},
 ): ChannelDto {
   return {
@@ -50,8 +74,10 @@ export function channelDto(
     createdAt: c.createdAt.toISOString(),
     lastMessageAt: iso(c.lastMessageAt),
     dmUserId: extra.dmUserId ? extra.dmUserId.toString() : null,
+    archivedAt: iso(c.archivedAt),
     joined: membership !== null,
     role: membership?.role ?? null,
+    notify: membership?.notify ?? 'mentions',
     lastReadId: membership?.lastReadId ? membership.lastReadId.toString() : null,
     unread: extra.unread ?? 0,
     mentions: extra.mentions ?? 0,
@@ -63,4 +89,5 @@ export const channelMeta = (c: ChannelDoc): ChannelMetaDto => ({
   name: c.name,
   topic: c.topic,
   memberCount: c.memberCount,
+  archivedAt: iso(c.archivedAt),
 });

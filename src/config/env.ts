@@ -45,6 +45,33 @@ const schema = z.object({
   /** Demo teammates answer DMs and mentions while nobody is signed in as them. */
   DEMO_REPLIES: z.stringbool().default(true),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
+
+  // ---- optional features: each works without these, with a fallback ----
+
+  /** The website's public address, used in links inside emails. Defaults to the first CORS_ORIGIN. */
+  APP_URL: z.string().default(''),
+  /**
+   * Emails (password reset, verification) go through Resend's HTTP API when this is set.
+   * Without it, the email is written to the API's log so you can still click the link.
+   */
+  RESEND_API_KEY: z.string().default(''),
+  MAIL_FROM: z.string().default('Guff <onboarding@resend.dev>'),
+  /** Fetch a title and image for the first link in a message. */
+  LINK_PREVIEWS: z.stringbool().default(true),
+  /** "Catch me up" summaries. Without a key the button is hidden. */
+  ANTHROPIC_API_KEY: z.string().default(''),
+  AI_MODEL: z.string().default('claude-haiku-5-5'),
+  /**
+   * Extra ICE servers for calls, as JSON: [{"urls":"turn:host:3478","username":"u","credential":"p"}].
+   * Calls on the same network work with the free public STUN server alone.
+   */
+  ICE_SERVERS: z.string().default(''),
+  /** Web push keys. When empty, Guff makes a pair once and keeps it in the database. */
+  VAPID_PUBLIC_KEY: z.string().default(''),
+  VAPID_PRIVATE_KEY: z.string().default(''),
+  VAPID_SUBJECT: z.string().default('mailto:admin@guff.local'),
+  /** How often (ms) scheduled messages and reminders are checked. */
+  SCHEDULER_INTERVAL_MS: z.coerce.number().int().min(200).default(15_000),
 });
 
 export type Env = z.infer<typeof schema>;
@@ -62,5 +89,7 @@ export function readEnv(source: NodeJS.ProcessEnv = process.env): Env {
         'Run "npm run setup" in the guff_backend folder to create them.',
     );
   }
+  if (!result.data.APP_URL)
+    result.data.APP_URL = result.data.CORS_ORIGIN.split(',')[0]!.trim().replace(/\/$/, '');
   return result.data;
 }

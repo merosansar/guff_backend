@@ -1,4 +1,5 @@
 import type { ChannelKind } from '../models/channel.js';
+import type { NotifyLevel, Role } from '../models/membership.js';
 import type { PublicUser } from '../models/user.js';
 
 export type PresenceStatus = 'online' | 'away' | 'offline';
@@ -17,6 +18,16 @@ export interface AttachmentDto {
   width: number | null;
   height: number | null;
   url: string;
+  durationMs: number | null;
+  waveform: number[] | null;
+}
+
+export interface LinkPreviewDto {
+  url: string;
+  title: string;
+  description: string;
+  image: string | null;
+  siteName: string;
 }
 
 export interface MessageDto {
@@ -35,6 +46,16 @@ export interface MessageDto {
   createdAt: string;
   editedAt: string | null;
   deletedAt: string | null;
+  /** How many earlier versions there are (shown as "edited", click for history). */
+  editCount: number;
+  pinnedAt: string | null;
+  pinnedBy: string | null;
+  threadRootId: string | null;
+  thread: { replyCount: number; lastReplyAt: string | null; participantIds: string[] } | null;
+  linkPreview: LinkPreviewDto | null;
+  webhook: { id: string; name: string } | null;
+  reminder: boolean;
+  ref: { channelId: string; messageId: string; authorId: string; excerpt: string } | null;
 }
 
 export interface ChannelDto {
@@ -49,8 +70,10 @@ export interface ChannelDto {
   lastMessageAt: string | null;
   /** For DMs: the other person (yourself, in a DM to yourself). */
   dmUserId: string | null;
+  archivedAt: string | null;
   joined: boolean;
-  role: 'owner' | 'member' | null;
+  role: Role | null;
+  notify: NotifyLevel;
   lastReadId: string | null;
   unread: number;
   mentions: number;
@@ -61,12 +84,27 @@ export interface ChannelMetaDto {
   name: string;
   topic: string;
   memberCount: number;
+  archivedAt: string | null;
 }
 
 export interface MessagePage {
   messages: MessageDto[];
   hasMoreBefore: boolean;
   hasMoreAfter: boolean;
+}
+
+export interface ThreadDto {
+  root: MessageDto;
+  replies: MessageDto[];
+}
+
+export interface CallInvite {
+  callId: string;
+  channelId: string;
+  fromUserId: string;
+  /** The caller's tab, so answers go to that one tab. */
+  fromSocketId: string;
+  video: boolean;
 }
 
 export interface ReadEvent {
@@ -87,6 +125,13 @@ export interface ServerToClientEvents {
   'channel:removed': (event: { channelId: string }) => void;
   'user:upsert': (user: UserWithPresence) => void;
   'auth:expired': () => void;
+  'bookmark:changed': (event: { messageId: string; saved: boolean }) => void;
+  'scheduled:changed': () => void;
+  'call:incoming': (invite: CallInvite) => void;
+  'call:accepted': (event: { callId: string; bySocketId: string; byUserId: string }) => void;
+  'call:declined': (event: { callId: string; reason: 'declined' | 'busy' }) => void;
+  'call:signal': (event: { callId: string; fromSocketId: string; data: unknown }) => void;
+  'call:ended': (event: { callId: string }) => void;
 }
 
 export type Ack<T = unknown> =

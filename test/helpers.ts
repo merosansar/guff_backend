@@ -1,6 +1,6 @@
 import mongoose from 'mongoose';
 import { type Socket, io as connect } from 'socket.io-client';
-import { type Guff, connectDatabase, createGuff } from '../src/app.js';
+import { type Guff, type GuffOptions, connectDatabase, createGuff } from '../src/app.js';
 import { type Env, loadEnvFile, readEnv } from '../src/config/env.js';
 import { createLogger } from '../src/lib/logger.js';
 import { Channel } from '../src/models/index.js';
@@ -44,10 +44,13 @@ export interface TestApp {
   close(): Promise<void>;
 }
 
-export async function startApp(overrides: Record<string, string> = {}): Promise<TestApp> {
+export async function startApp(
+  overrides: Record<string, string> = {},
+  options: GuffOptions = {},
+): Promise<TestApp> {
   const env = testEnv(overrides);
   await connectDatabase(env);
-  const guff = await createGuff(env, silentLog);
+  const guff = await createGuff(env, silentLog, { previews: null, ...options });
   const port = await guff.listen(0);
   return { guff, url: `http://127.0.0.1:${port}`, env, close: () => guff.close() };
 }

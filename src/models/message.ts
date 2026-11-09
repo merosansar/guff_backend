@@ -23,6 +23,9 @@ export interface Attachment {
   contentType: string;
   width: number | null;
   height: number | null;
+  /** Voice messages: length and a small loudness outline for drawing the waveform. */
+  durationMs: number | null;
+  waveform: number[] | null;
 }
 
 export interface Reaction {
@@ -34,6 +37,35 @@ export interface ReplyRef {
   messageId: Types.ObjectId;
   authorId: Types.ObjectId;
   /** A short copy of the original, so the quote still reads if the original is edited. */
+  excerpt: string;
+}
+
+export interface EditRecord {
+  text: string;
+  /** When this version was replaced. */
+  replacedAt: Date;
+}
+
+export interface ThreadInfo {
+  replyCount: number;
+  lastReplyAt: Date | null;
+  /** The first few people who replied, for the little avatars under the message. */
+  participantIds: Types.ObjectId[];
+}
+
+export interface LinkPreview {
+  url: string;
+  title: string;
+  description: string;
+  image: string | null;
+  siteName: string;
+}
+
+/** A pointer to another message, shown as a card (used by reminders). */
+export interface MessageRef {
+  channelId: Types.ObjectId;
+  messageId: Types.ObjectId;
+  authorId: Types.ObjectId;
   excerpt: string;
 }
 
@@ -54,6 +86,20 @@ export interface MessageDoc {
   automated: boolean;
   editedAt: Date | null;
   deletedAt: Date | null;
+  /** Earlier versions, oldest first (the last 20). */
+  edits: EditRecord[];
+  pinnedAt: Date | null;
+  pinnedBy: Types.ObjectId | null;
+  /** Set on a reply in a thread: the message the thread hangs off. */
+  threadRootId: Types.ObjectId | null;
+  /** Set on a message that has a thread. */
+  thread: ThreadInfo | null;
+  linkPreview: LinkPreview | null;
+  /** Posted by an incoming webhook (an integration) rather than typed by a person. */
+  webhook: { id: Types.ObjectId; name: string } | null;
+  /** A reminder you set, delivered to your notes. */
+  reminder: boolean;
+  ref: MessageRef | null;
 }
 
 const attachmentSchema = new Schema<Attachment>(
@@ -64,6 +110,8 @@ const attachmentSchema = new Schema<Attachment>(
     contentType: { type: String, required: true },
     width: { type: Number, default: null },
     height: { type: Number, default: null },
+    durationMs: { type: Number, default: null },
+    waveform: { type: [Number], default: null },
   },
   { _id: false },
 );
@@ -103,6 +151,65 @@ const messageSchema = new Schema<MessageDoc>(
     automated: { type: Boolean, default: false },
     editedAt: { type: Date, default: null },
     deletedAt: { type: Date, default: null },
+    edits: {
+      type: [
+        new Schema<EditRecord>(
+          { text: { type: String, default: '' }, replacedAt: { type: Date, required: true } },
+          { _id: false },
+        ),
+      ],
+      default: [],
+    },
+    pinnedAt: { type: Date, default: null },
+    pinnedBy: { type: Schema.Types.ObjectId, default: null },
+    threadRootId: { type: Schema.Types.ObjectId, default: null },
+    thread: {
+      type: new Schema<ThreadInfo>(
+        {
+          replyCount: { type: Number, default: 0 },
+          lastReplyAt: { type: Date, default: null },
+          participantIds: { type: [Schema.Types.ObjectId], default: [] },
+        },
+        { _id: false },
+      ),
+      default: null,
+    },
+    linkPreview: {
+      type: new Schema<LinkPreview>(
+        {
+          url: { type: String, required: true },
+          title: { type: String, default: '' },
+          description: { type: String, default: '' },
+          image: { type: String, default: null },
+          siteName: { type: String, default: '' },
+        },
+        { _id: false },
+      ),
+      default: null,
+    },
+    webhook: {
+      type: new Schema(
+        {
+          id: { type: Schema.Types.ObjectId, required: true },
+          name: { type: String, required: true },
+        },
+        { _id: false },
+      ),
+      default: null,
+    },
+    reminder: { type: Boolean, default: false },
+    ref: {
+      type: new Schema<MessageRef>(
+        {
+          channelId: { type: Schema.Types.ObjectId, required: true },
+          messageId: { type: Schema.Types.ObjectId, required: true },
+          authorId: { type: Schema.Types.ObjectId, required: true },
+          excerpt: { type: String, default: '' },
+        },
+        { _id: false },
+      ),
+      default: null,
+    },
   },
   // ObjectIds already carry the creation time; no separate createdAt needed.
   { versionKey: false },
@@ -110,6 +217,9 @@ const messageSchema = new Schema<MessageDoc>(
 
 // History pages: newest first within a channel.
 messageSchema.index({ channelId: 1, _id: -1 });
+// The main timeline (threadRootId null) and each thread, newest first.
+messageSchema.index({ channelId: 1, threadRootId: 1, _id: -1 });
+messageSchema.index({ channelId: 1, pinnedAt: -1 }, { partialFilterExpression: { pinnedAt: { $type: 'date' } } });
 // One clientId per author: a resend returns the message that was already saved.
 messageSchema.index(
   { authorId: 1, clientId: 1 },

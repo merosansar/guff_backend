@@ -2,7 +2,7 @@ import { Types } from 'mongoose';
 import { badRequest, conflict, forbidden, isDuplicateKey, notFound } from '../lib/errors.js';
 import { channelSlug } from '../lib/text.js';
 import { Channel, type ChannelDoc, dmKeyFor } from '../models/channel.js';
-import { Membership, type MembershipDoc } from '../models/membership.js';
+import { Membership, type MembershipDoc, type NotifyLevel } from '../models/membership.js';
 import { Message } from '../models/message.js';
 import { User } from '../models/user.js';
 import type { RealtimeBus } from '../realtime/bus.js';
@@ -13,6 +13,26 @@ import { channelDto, channelMeta } from './serialize.js';
 export const UNREAD_CAP = 100;
 
 const ZERO_ID = new Types.ObjectId('000000000000000000000000');
+
+/** Owners and admins look after a channel. */
+export const isManager = (m: Pick<MembershipDoc, 'role'> | null | undefined) =>
+  m?.role === 'owner' || m?.role === 'admin';
+
+/**
+ * What counts as unread for someone: messages by others (plus reminders they set and
+ * integration posts), in the
+ * main timeline. Thread replies only count when they mention you.
+ */
+export function unreadFilter(me: Types.ObjectId) {
+  return {
+    kind: 'user' as const,
+    deletedAt: null,
+    $and: [
+      { $or: [{ authorId: { $ne: me } }, { reminder: true }, { webhook: { $ne: null } }] },
+      { $or: [{ threadRootId: null }, { mentions: me }] },
+    ],
+  };
+}
 
 export interface Access {
   channel: ChannelDoc;
@@ -54,6 +74,28 @@ export class ChannelService {
     return result as Access & { membership: MembershipDoc };
   }
 
+  /** A member of a channel that isn't archived: someone who can post. */
+  async requirePoster(
+    userId: string,
+    channelId: string,
+  ): Promise<Access & { membership: MembershipDoc }> {
+    const result = await this.requireMember(userId, channelId);
+    if (result.channel.archivedAt)
+      throw forbidden(`#${result.channel.name} is archived, so nobody can post in it.`);
+    return result;
+  }
+
+  async requireManager(
+    userId: string,
+    channelId: string,
+  ): Promise<Access & { membership: MembershipDoc }> {
+    const result = await this.requireMember(userId, channelId);
+    if (result.channel.kind === 'dm') throw badRequest('Direct messages don’t have admins.');
+    if (!isManager(result.membership))
+      throw forbidden('Only the channel’s owner and admins can do that.');
+    return result;
+  }
+
   /** The sidebar: every channel and DM you're in, with unread and mention counts. */
   async listForUser(userId: string): Promise<ChannelDto[]> {
     const me = new Types.ObjectId(userId);
@@ -74,9 +116,7 @@ export class ChannelService {
                 $expr: {
                   $and: [{ $eq: ['$channelId', '$$channelId'] }, { $gt: ['$_id', '$$lastRead'] }],
                 },
-                authorId: { $ne: me },
-                kind: 'user',
-                deletedAt: null,
+                ...unreadFilter(me),
               },
             },
             { $limit: UNREAD_CAP },
@@ -140,7 +180,7 @@ export class ChannelService {
       .lean<ChannelDoc[]>();
     const mine = await Membership.find(
       { userId, channelId: { $in: channels.map((c) => c._id) } },
-      { channelId: 1, role: 1, lastReadId: 1 },
+      { channelId: 1, role: 1, lastReadId: 1, notify: 1 },
     ).lean();
     const byChannel = new Map(mine.map((m) => [m.channelId.toString(), m]));
     return channels.map((c) => channelDto(c, byChannel.get(c._id.toString()) ?? null));
@@ -262,8 +302,8 @@ export class ChannelService {
       if (name.length < 2)
         throw badRequest('Give the channel a name of at least 2 letters or numbers.');
       if (name !== channel.name) {
-        if (membership.role !== 'owner')
-          throw forbidden('Only the person who created the channel can rename it.');
+        if (!isManager(membership))
+          throw forbidden('Only the channel’s owner and admins can rename it.');
         if (channel.name === 'general') throw badRequest('#general keeps its name.');
         changes.name = name;
       }
@@ -340,6 +380,71 @@ export class ChannelService {
     }
   }
 
+  // ---- looking after a channel ------------------------------------------------------
+
+  /** Owners can make people admins (or take it back). */
+  async setRole(
+    userId: string,
+    channelId: string,
+    targetId: string,
+    role: 'admin' | 'member',
+  ): Promise<void> {
+    const { membership } = await this.requireManager(userId, channelId);
+    if (membership.role !== 'owner') throw forbidden('Only the channel’s owner can change admins.');
+    const target = await Membership.findOne({ channelId, userId: targetId }).lean<MembershipDoc>();
+    if (!target) throw notFound('That person isn’t in this channel.');
+    if (target.role === 'owner') throw badRequest('The owner is always in charge.');
+    if (target.role === role) return;
+    await Membership.updateOne({ _id: target._id }, { $set: { role } });
+    await this.postSystem(
+      userId,
+      channelId,
+      role === 'admin' ? `made <@${targetId}> an admin` : `removed <@${targetId}> as an admin`,
+    );
+    this.bus.toUser(targetId, 'channel:upsert', await this.get(targetId, channelId));
+    await this.broadcastMeta(channelId);
+  }
+
+  /** Owners and admins can remove people (admins can't remove other admins or the owner). */
+  async removeMember(userId: string, channelId: string, targetId: string): Promise<void> {
+    if (userId === targetId) throw badRequest('To leave the channel yourself, use “Leave”.');
+    const { channel, membership } = await this.requireManager(userId, channelId);
+    if (channel.isDefault) throw badRequest(`Everyone stays in #${channel.name}.`);
+    const target = await Membership.findOne({ channelId, userId: targetId }).lean<MembershipDoc>();
+    if (!target) throw notFound('That person isn’t in this channel.');
+    if (target.role === 'owner') throw forbidden('The channel’s owner can’t be removed.');
+    if (target.role === 'admin' && membership.role !== 'owner')
+      throw forbidden('Only the owner can remove an admin.');
+    const removed = await Membership.deleteOne({ _id: target._id });
+    if (!removed.deletedCount) return;
+    await Channel.updateOne({ _id: channel._id }, { $inc: { memberCount: -1 } });
+    await this.postSystem(userId, channelId, `removed <@${targetId}> from #${channel.name}`);
+    this.bus.leaveChannel(targetId, channelId);
+    this.bus.toUser(targetId, 'channel:removed', { channelId });
+    await this.broadcastMeta(channelId);
+  }
+
+  /** Archived channels keep their history but take no new messages. */
+  async setArchived(userId: string, channelId: string, archived: boolean): Promise<ChannelDto> {
+    const { channel } = await this.requireManager(userId, channelId);
+    if (channel.isDefault && archived) throw badRequest(`#${channel.name} can’t be archived.`);
+    if (!!channel.archivedAt === archived) return this.get(userId, channelId);
+    if (!archived) await Channel.updateOne({ _id: channel._id }, { $set: { archivedAt: null } });
+    await this.postSystem(userId, channelId, archived ? `archived #${channel.name}` : `unarchived #${channel.name}`);
+    if (archived) await Channel.updateOne({ _id: channel._id }, { $set: { archivedAt: new Date() } });
+    await this.broadcastMeta(channelId);
+    return this.get(userId, channelId);
+  }
+
+  /** How loudly this conversation should get your attention. */
+  async setNotify(userId: string, channelId: string, level: NotifyLevel): Promise<ChannelDto> {
+    const { membership } = await this.requireMember(userId, channelId);
+    await Membership.updateOne({ _id: membership._id }, { $set: { notify: level } });
+    const dto = await this.get(userId, channelId);
+    this.bus.toUser(userId, 'channel:upsert', dto);
+    return dto;
+  }
+
   // ---- helpers ----------------------------------------------------------------
 
   /** Returns true if the person wasn't a member yet. Their tabs join the room straight away. */
@@ -391,9 +496,7 @@ export class ChannelService {
       const filter = {
         channelId: channel._id,
         _id: { $gt: membership.lastReadId ?? ZERO_ID },
-        authorId: { $ne: me },
-        kind: 'user' as const,
-        deletedAt: null,
+        ...unreadFilter(me),
       };
       [unread, mentions] = await Promise.all([
         Message.countDocuments(filter, { limit: UNREAD_CAP }),

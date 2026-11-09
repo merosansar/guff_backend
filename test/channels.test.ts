@@ -151,7 +151,7 @@ describe('channels', () => {
       .set(bearer(sita))
       .send({ name: 'recruiting' })
       .expect(403);
-    expect(rename.body.message).toBe('Only the person who created the channel can rename it.');
+    expect(rename.body.message).toBe('Only the channel’s owner and admins can rename it.');
     const topic = await api()
       .patch(`/api/channels/${id}`)
       .set(bearer(sita))

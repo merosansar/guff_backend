@@ -21,7 +21,41 @@ const ALLOWED = new Map<string, { inline: boolean }>([
   ['application/vnd.openxmlformats-officedocument.presentationml.presentation', { inline: false }],
   ['application/zip', { inline: false }],
   ['text/plain; charset=utf-8', { inline: false }],
+  ['audio/webm', { inline: true }],
+  ['audio/ogg', { inline: true }],
+  ['audio/mp4', { inline: true }],
+  ['audio/mpeg', { inline: true }],
 ]);
+
+/**
+ * Recorders write audio into containers that also hold video, so the bytes alone can't
+ * tell. For a voice message (the browser says so) these count as audio.
+ */
+const VOICE_TYPES = new Map<string, string>([
+  ['video/webm', 'audio/webm'],
+  ['audio/webm', 'audio/webm'],
+  ['audio/ogg', 'audio/ogg'],
+  ['audio/opus', 'audio/ogg'],
+  ['video/mp4', 'audio/mp4'],
+  ['audio/mp4', 'audio/mp4'],
+  ['audio/x-m4a', 'audio/mp4'],
+  ['audio/aac', 'audio/mp4'],
+]);
+const AUDIO_TYPES = new Map<string, string>([
+  ['audio/mpeg', 'audio/mpeg'],
+  ['audio/ogg', 'audio/ogg'],
+  ['audio/x-m4a', 'audio/mp4'],
+  ['audio/mp4', 'audio/mp4'],
+  ['audio/webm', 'audio/webm'],
+]);
+
+/** Five minutes of voice is plenty. */
+export const MAX_VOICE_MS = 5 * 60_000;
+
+export interface VoiceInfo {
+  durationMs: number;
+  waveform: number[];
+}
 
 const TEXT_NAMES = /\.(txt|md|csv|log|json|ya?ml)$/i;
 
@@ -30,6 +64,8 @@ interface FileMetadata {
   contentType: string;
   width: number | null;
   height: number | null;
+  durationMs?: number | null;
+  waveform?: number[] | null;
   /** Set when the file is attached to a message. Unattached files are removed after a day. */
   channelId: Types.ObjectId | null;
 }
@@ -91,12 +127,18 @@ export class FileService {
   async upload(
     uploaderId: string,
     file: { buffer: Buffer; originalname: string },
+    voice?: VoiceInfo,
   ): Promise<AttachmentDto> {
     if (file.buffer.length === 0) throw badRequest('That file is empty.');
     const name = cleanName(file.originalname);
 
     const detected = await fileTypeFromBuffer(file.buffer);
-    let contentType = detected?.mime ?? null;
+    let contentType: string | null = detected?.mime ?? null;
+    if (contentType && voice) contentType = VOICE_TYPES.get(contentType) ?? null;
+    else if (contentType && AUDIO_TYPES.has(contentType)) contentType = AUDIO_TYPES.get(contentType)!;
+    if (voice && !contentType) {
+      throw new HttpError(415, 'That recording format isn’t supported. Try another browser.');
+    }
     if (!contentType && TEXT_NAMES.test(name) && isUtf8Text(file.buffer)) {
       contentType = 'text/plain; charset=utf-8';
     }
@@ -123,11 +165,17 @@ export class FileService {
     }
 
     const id = new Types.ObjectId();
+    const durationMs = voice ? Math.round(Math.min(Math.max(voice.durationMs, 0), MAX_VOICE_MS)) : null;
+    const waveform = voice
+      ? voice.waveform.slice(0, 64).map((v) => Math.round(Math.min(Math.max(v, 0), 100)))
+      : null;
     const metadata: FileMetadata = {
       uploaderId: new Types.ObjectId(uploaderId),
       contentType,
       width,
       height,
+      durationMs,
+      waveform,
       channelId: null,
     };
     await new Promise<void>((resolve, reject) => {
@@ -137,7 +185,16 @@ export class FileService {
       stream.end(file.buffer);
     });
 
-    return this.toDto({ fileId: id, name, size: file.buffer.length, contentType, width, height });
+    return this.toDto({
+      fileId: id,
+      name,
+      size: file.buffer.length,
+      contentType,
+      width,
+      height,
+      durationMs,
+      waveform,
+    });
   }
 
   /** Attaches uploaded files to a message. Only the uploader can attach them, and only once. */
@@ -171,6 +228,8 @@ export class FileService {
         contentType: f.metadata.contentType,
         width: f.metadata.width,
         height: f.metadata.height,
+        durationMs: f.metadata.durationMs ?? null,
+        waveform: f.metadata.waveform ?? null,
       };
     });
   }
@@ -187,7 +246,9 @@ export class FileService {
       size: file.length,
       contentType: file.metadata.contentType,
       inline,
-      stream: () => this.bucket.openDownloadStream(file._id),
+      /** `end` is exclusive, as GridFS expects. */
+      stream: (range?: { start: number; end: number }) =>
+        this.bucket.openDownloadStream(file._id, range),
     };
   }
 
@@ -223,6 +284,8 @@ export class FileService {
       width: a.width,
       height: a.height,
       url: this.tokens.signFileUrl(id),
+      durationMs: a.durationMs ?? null,
+      waveform: a.waveform ?? null,
     };
   }
 }

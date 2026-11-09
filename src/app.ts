@@ -16,12 +16,18 @@ import { TokenService } from './lib/tokens.js';
 import { ensureIndexes } from './models/index.js';
 import { RealtimeBus } from './realtime/bus.js';
 import { type GuffServer, createSocketServer } from './realtime/socket.js';
+import { AiService } from './services/ai.js';
 import { AuthService } from './services/auth.js';
 import { ChannelService } from './services/channels.js';
 import { DemoReplies } from './services/demo-replies.js';
 import { FileService } from './services/files.js';
-import { MessageService } from './services/messages.js';
+import { cachedPreviews } from './services/links.js';
+import { type Mailer, createMailer } from './services/mail.js';
+import { MessageService, type PreviewFetcher } from './services/messages.js';
 import { PeopleService } from './services/people.js';
+import { PushService } from './services/push.js';
+import { Scheduler } from './services/scheduler.js';
+import { WebhookService } from './services/webhooks.js';
 
 const ADAPTER_COLLECTION = 'socket.io-adapter-events';
 /** Where `npm run build` in guff_frontend/ puts the website. */
@@ -44,6 +50,10 @@ export interface Guff {
     people: PeopleService;
     files: FileService;
     auth: AuthService;
+    scheduler: Scheduler;
+    webhooks: WebhookService;
+    push: PushService;
+    ai: AiService;
   };
   listen(port: number): Promise<number>;
   close(): Promise<void>;
@@ -95,7 +105,28 @@ async function supportsChangeStreams(): Promise<boolean> {
   return Boolean(hello.setName || hello.msg === 'isdbgrid');
 }
 
-export async function createGuff(env: Env, log: Logger): Promise<Guff> {
+/** The free public STUN server lets calls find a path through most home routers. */
+function iceServersFrom(raw: string, log: Logger): unknown[] {
+  const servers: unknown[] = [{ urls: 'stun:stun.l.google.com:19302' }];
+  if (!raw.trim()) return servers;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (Array.isArray(parsed)) return [...servers, ...parsed];
+  } catch {
+    /* reported below */
+  }
+  log.warn('ICE_SERVERS is not a JSON list; calls will only use the public STUN server');
+  return servers;
+}
+
+export interface GuffOptions {
+  /** Replace the mailer (tests read the emails it collects). */
+  mailer?: Mailer;
+  /** Replace how link previews are fetched (tests don't go on the internet). */
+  previews?: PreviewFetcher | null;
+}
+
+export async function createGuff(env: Env, log: Logger, options: GuffOptions = {}): Promise<Guff> {
   const corsOrigin = env.CORS_ORIGIN.split(',')
     .map((o) => o.trim())
     .filter(Boolean);
@@ -106,7 +137,21 @@ export async function createGuff(env: Env, log: Logger): Promise<Guff> {
   const channels = new ChannelService(bus);
   const messages = new MessageService(bus, channels, files);
   const people = new PeopleService(bus, env.DEMO_REPLIES);
-  const auth = new AuthService(tokens, env.REFRESH_TOKEN_TTL_DAYS, channels, people, bus);
+  const mailer = options.mailer ?? createMailer({ apiKey: env.RESEND_API_KEY, from: env.MAIL_FROM, log });
+  const auth = new AuthService(tokens, env.REFRESH_TOKEN_TTL_DAYS, channels, people, bus, {
+    mailer,
+    appUrl: env.APP_URL,
+    log,
+  });
+  const previews = options.previews !== undefined ? options.previews : env.LINK_PREVIEWS ? cachedPreviews() : null;
+  if (previews) messages.usePreviews(previews);
+  const scheduler = new Scheduler(channels, messages, bus, log);
+  const webhooks = new WebhookService(channels, messages, env.APP_URL);
+  const push = new PushService(bus, log, env.VAPID_SUBJECT);
+  await push.init({ publicKey: env.VAPID_PUBLIC_KEY, privateKey: env.VAPID_PRIVATE_KEY });
+  push.listen(messages);
+  const ai = new AiService(channels, env.ANTHROPIC_API_KEY, env.AI_MODEL, log);
+  const iceServers = iceServersFrom(env.ICE_SERVERS, log);
 
   const app = express();
   app.disable('x-powered-by');
@@ -117,7 +162,23 @@ export async function createGuff(env: Env, log: Logger): Promise<Guff> {
   app.use(cors({ origin: corsOrigin, credentials: true }));
   app.use(express.json({ limit: '100kb' }));
   app.use(cookieParser());
-  app.use('/api', apiRoutes({ env, tokens, auth, people, channels, messages, files }));
+  app.use(
+    '/api',
+    apiRoutes({
+      env,
+      tokens,
+      auth,
+      people,
+      channels,
+      messages,
+      files,
+      scheduler,
+      webhooks,
+      push,
+      ai,
+      iceServers,
+    }),
+  );
   if (env.SERVE_WEB) {
     serveWebsite(app);
   } else {
@@ -162,12 +223,13 @@ export async function createGuff(env: Env, log: Logger): Promise<Guff> {
       .catch((error: unknown) => log.warn({ err: error }, 'orphan sweep failed'));
   }, 3_600_000);
   orphanSweep.unref();
+  if (env.NODE_ENV !== 'test') scheduler.start(env.SCHEDULER_INTERVAL_MS);
 
   return {
     app,
     httpServer,
     io,
-    services: { tokens, channels, messages, people, files, auth },
+    services: { tokens, channels, messages, people, files, auth, scheduler, webhooks, push, ai },
     listen: (port) =>
       new Promise((resolve, reject) => {
         httpServer.once('error', reject);
@@ -178,6 +240,7 @@ export async function createGuff(env: Env, log: Logger): Promise<Guff> {
       }),
     close: async () => {
       clearInterval(orphanSweep);
+      scheduler.stop();
       demo.stop();
       await new Promise<void>((resolve) => io.close(() => resolve()));
       if (httpServer.listening)

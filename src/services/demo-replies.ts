@@ -153,7 +153,7 @@ export class DemoReplies {
   }
 
   private async handle({ message, channel }: MessageCreated): Promise<void> {
-    if (message.kind !== 'user' || message.automated) return;
+    if (message.kind !== 'user' || message.automated || message.webhook || message.reminder) return;
     const author = await User.findById(message.authorId).lean<UserDoc>();
     if (!author || author.demoBot) return;
 
@@ -173,7 +173,14 @@ export class DemoReplies {
     for (const bot of bots) {
       // Someone is signed in as this teammate: they answer for themselves.
       if ((await this.bus.userSockets(bot._id.toString())).sockets > 0) continue;
-      this.schedule(bot, author, channel._id.toString(), message.text, message._id.toString());
+      this.schedule(
+        bot,
+        author,
+        channel._id.toString(),
+        message.text,
+        message._id.toString(),
+        message.threadRootId?.toString(),
+      );
     }
   }
 
@@ -184,6 +191,7 @@ export class DemoReplies {
     channelId: string,
     text: string,
     triggerId: string,
+    threadRootId?: string,
   ): void {
     const key = `${channelId}:${bot._id.toString()}`;
     this.pending.get(key)?.forEach(clearTimeout);
@@ -198,7 +206,13 @@ export class DemoReplies {
       this.pending.delete(key);
       this.bus.toChannel(channelId, 'typing', { channelId, userId: botId, typing: false });
       this.messages
-        .send(botId, { channelId, clientId: `demo-${triggerId}`, text: reply, automated: true })
+        .send(botId, {
+          channelId,
+          clientId: `demo-${triggerId}`,
+          text: reply,
+          automated: true,
+          threadRootId,
+        })
         .catch((error: unknown) => this.log.warn({ err: error }, 'demo reply failed'));
     }, 1200 + typingFor);
     this.pending.set(key, [startTyping, send]);

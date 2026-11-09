@@ -6,6 +6,7 @@ import { HttpError, describeZodError } from '../lib/errors.js';
 import { objectIdString } from '../lib/ids.js';
 import { TokenBucket } from '../lib/rate-limiter.js';
 import type { TokenService } from '../lib/tokens.js';
+import { Channel, type ChannelDoc } from '../models/channel.js';
 import { Membership } from '../models/membership.js';
 import { User } from '../models/user.js';
 import type { ChannelService } from '../services/channels.js';
@@ -27,7 +28,7 @@ interface LocalState {
   /** Channel rooms to join, loaded during the handshake. */
   rooms: string[];
   expiryTimer?: NodeJS.Timeout;
-  buckets: { messages: TokenBucket; typing: TokenBucket; actions: TokenBucket };
+  buckets: { messages: TokenBucket; typing: TokenBucket; actions: TokenBucket; calls: TokenBucket };
 }
 
 type AckFn = (response: Ack) => void;
@@ -53,6 +54,7 @@ const schemas = {
     text: text.default(''),
     replyToId: objectIdString.optional(),
     attachmentIds: z.array(objectIdString).max(10, 'Attach up to 10 files at a time.').optional(),
+    threadRootId: objectIdString.optional(),
   }),
   edit: z.object({ messageId: objectIdString, text }),
   remove: z.object({ messageId: objectIdString }),
@@ -61,7 +63,34 @@ const schemas = {
   typing: z.object({ channelId: objectIdString, typing: z.boolean() }),
   idle: z.object({ idle: z.boolean() }),
   renew: z.object({ token: z.string().min(10) }),
+  callInvite: z.object({
+    callId: z.string().regex(/^[\w-]{8,64}$/),
+    channelId: objectIdString,
+    video: z.boolean(),
+  }),
+  callReply: z.object({
+    callId: z.string().regex(/^[\w-]{8,64}$/),
+    channelId: objectIdString,
+    toSocketId: z.string().min(1).max(64),
+  }),
+  callSignal: z.object({
+    callId: z.string().regex(/^[\w-]{8,64}$/),
+    channelId: objectIdString,
+    toSocketId: z.string().min(1).max(64),
+    data: z.unknown(),
+  }),
+  callEnd: z.object({
+    callId: z.string().regex(/^[\w-]{8,64}$/),
+    channelId: objectIdString,
+    /** Only the caller logs the call, once: "missed" if nobody answered. */
+    log: z.enum(['missed', 'ended']).optional(),
+    durationSec: z.number().int().min(0).max(86_400).optional(),
+    video: z.boolean().optional(),
+  }),
 };
+
+const formatDuration = (sec: number) =>
+  sec < 60 ? `${sec} sec` : sec < 3600 ? `${Math.round(sec / 60)} min` : `${Math.floor(sec / 3600)} h ${Math.round((sec % 3600) / 60)} min`;
 
 export interface RealtimeDeps {
   tokens: TokenService;
@@ -99,6 +128,8 @@ export function createSocketServer(httpServer: HttpServer, deps: RealtimeDeps): 
           messages: new TokenBucket(8, 1),
           typing: new TokenBucket(6, 1),
           actions: new TokenBucket(20, 3),
+          // Call setup sends a burst of ICE candidates.
+          calls: new TokenBucket(120, 20),
         },
       });
       scheduleExpiry(socket, claims.exp);
@@ -209,6 +240,74 @@ export function createSocketServer(httpServer: HttpServer, deps: RealtimeDeps): 
       const claims = await tokens.verifyAccess(input.token);
       if (claims.userId !== userId) throw new HttpError(401, 'That token belongs to someone else.');
       scheduleExpiry(socket, claims.exp);
+      return null;
+    });
+
+    // ---- calls: the server only relays between the two people in a DM ----------------
+
+    /** The other person in a DM you're in. Calls only happen one to one. */
+    const partnerIn = async (channelId: string): Promise<string> => {
+      const channel = await Channel.findById(channelId).lean<ChannelDoc>();
+      if (!channel || channel.kind !== 'dm') throw new HttpError(400, 'Calls work in direct messages.');
+      const members = await Membership.find({ channelId: channel._id }, { userId: 1 }).lean();
+      if (!members.some((m) => m.userId.equals(userId))) throw new HttpError(404, 'That conversation doesn’t exist.');
+      const other = members.find((m) => !m.userId.equals(userId));
+      if (!other) throw new HttpError(400, 'You can’t call yourself.');
+      return other.userId.toString();
+    };
+    /** Signals go to one tab, and only a tab of the person you're talking to. */
+    const partnerSocket = async (channelId: string, socketId: string) => {
+      const partner = await partnerIn(channelId);
+      const sockets = await io.in(userRoom(partner)).fetchSockets();
+      if (!sockets.some((s) => s.id === socketId)) throw new HttpError(410, 'The call ended.');
+      return partner;
+    };
+
+    handle('call:invite', schemas.callInvite, 'actions', async (input) => {
+      const partner = await partnerIn(input.channelId);
+      const online = await io.in(userRoom(partner)).fetchSockets();
+      if (online.length === 0) throw new HttpError(409, 'They’re offline right now. Try again later.');
+      io.to(userRoom(partner)).emit('call:incoming', {
+        callId: input.callId,
+        channelId: input.channelId,
+        fromUserId: userId,
+        fromSocketId: socket.id,
+        video: input.video,
+      });
+      return null;
+    });
+    handle('call:accept', schemas.callReply, 'calls', async (input) => {
+      await partnerSocket(input.channelId, input.toSocketId);
+      const event = { callId: input.callId, bySocketId: socket.id, byUserId: userId };
+      io.to(input.toSocketId).emit('call:accepted', event);
+      // Your other tabs stop ringing.
+      socket.to(userRoom(userId)).emit('call:accepted', event);
+      return null;
+    });
+    handle('call:decline', schemas.callReply, 'calls', async (input) => {
+      await partnerSocket(input.channelId, input.toSocketId);
+      io.to(input.toSocketId).emit('call:declined', { callId: input.callId, reason: 'declined' });
+      socket.to(userRoom(userId)).emit('call:ended', { callId: input.callId });
+      return null;
+    });
+    handle('call:signal', schemas.callSignal, 'calls', async (input) => {
+      await partnerSocket(input.channelId, input.toSocketId);
+      io.to(input.toSocketId).emit('call:signal', { callId: input.callId, fromSocketId: socket.id, data: input.data });
+      return null;
+    });
+    handle('call:end', schemas.callEnd, 'calls', async (input) => {
+      const partner = await partnerIn(input.channelId);
+      io.to([userRoom(partner), userRoom(userId)]).emit('call:ended', { callId: input.callId });
+      if (input.log) {
+        const kind = input.video ? 'video call' : 'call';
+        await messages.system(
+          userId,
+          input.channelId,
+          input.log === 'missed'
+            ? `started a ${kind} · no answer`
+            : `had a ${kind} · ${formatDuration(input.durationSec ?? 0)}`,
+        );
+      }
       return null;
     });
 
